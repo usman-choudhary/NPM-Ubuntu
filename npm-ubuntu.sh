@@ -4,6 +4,7 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 # Author: tteck (tteckster) | Co-Author: CrazyWolf13
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://nginxproxymanager.com/
+# Modified for Ubuntu by: Usman Choudhary
 
 APP="Nginx Proxy Manager"
 var_tags="${var_tags:-proxy}"
@@ -11,7 +12,7 @@ var_cpu="${var_cpu:-2}"
 var_ram="${var_ram:-2048}"
 var_disk="${var_disk:-8}"
 var_os="${var_os:-ubuntu}"
-var_version="${var_version:-22.04}"  # 20.04, 22.04, or 24.04
+var_version="${var_version:-24.04}"  # 22.04 or 24.04
 var_unprivileged="${var_unprivileged:-1}"
 
 header_info "$APP"
@@ -29,12 +30,20 @@ function update_script() {
     exit
   fi
 
-  # Ubuntu-specific optimization: Check for systemd-resolved and configure appropriately
+  # Ubuntu version check
+  UBUNTU_VERSION=$(grep -oP 'VERSION_ID="\K[^"]+' /etc/os-release)
+  if [[ "$UBUNTU_VERSION" != "22.04" ]] && [[ "$UBUNTU_VERSION" != "24.04" ]]; then
+    msg_error "Unsupported Ubuntu version: $UBUNTU_VERSION"
+    msg_error "This script supports Ubuntu 22.04 LTS and 24.04 LTS only"
+    exit
+  fi
+
+  # Configure DNS resolver for Ubuntu (systemd-resolved)
   if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    msg_info "Configuring for systemd-resolved (Ubuntu)"
-    # Use systemd-resolved stub resolver
+    msg_info "Configuring DNS for systemd-resolved (Ubuntu)"
     mkdir -p /etc/nginx/conf.d/include
-    echo "resolver 127.0.0.53;" > /etc/nginx/conf.d/include/resolvers.conf
+    echo "resolver 127.0.0.53 valid=10s;" > /etc/nginx/conf.d/include/resolvers.conf
+    echo "resolver_timeout 5s;" >> /etc/nginx/conf.d/include/resolvers.conf
   else
     # Fallback to traditional resolv.conf
     echo resolver "$(awk 'BEGIN{ORS=" "} $1=="nameserver" {print ($2 ~ ":")? "["$2"]": $2}' /etc/resolv.conf);" >/etc/nginx/conf.d/include/resolvers.conf
@@ -45,28 +54,16 @@ function update_script() {
     if [[ "$CURRENT_NODE_VERSION" != "22" ]]; then
       msg_info "Upgrading Node.js to version 22"
       systemctl stop openresty
-      
-      # Ubuntu-specific: Use Nodesource repository for Node.js 22
-      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
       apt-get purge -y nodejs npm
       apt-get autoremove -y
-      apt-get install -y nodejs
-      
       rm -rf /usr/local/bin/node /usr/local/bin/npm
       rm -rf /usr/local/lib/node_modules
       rm -rf ~/.npm
       rm -rf /root/.npm
     fi
-  else
-    # Fresh Node.js installation using Nodesource
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
   fi
 
-  # Install Yarn using Ubuntu's preferred method
-  if ! command -v yarn &>/dev/null; then
-    npm install -g yarn
-  fi
+  NODE_VERSION="22" NODE_MODULE="yarn" setup_nodejs
 
   RELEASE="2.13.4"
   CLEAN_INSTALL=1 fetch_and_deploy_gh_release "nginxproxymanager" "NginxProxyManager/nginx-proxy-manager" "tarball" "v${RELEASE}" "/opt/nginxproxymanager"
@@ -86,14 +83,7 @@ function update_script() {
   msg_ok "Cleaned old files"
 
   msg_info "Setting up Environment"
-  # Ubuntu-specific: Ensure python3 is properly linked
-  if [[ ! -f /usr/bin/python ]]; then
-    ln -sf /usr/bin/python3 /usr/bin/python
-  fi
-  
-  # Install Ubuntu build dependencies
-  apt-get install -y build-essential python3-dev python3-pip python3-venv
-  
+  ln -sf /usr/bin/python3 /usr/bin/python
   ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
   ln -sf /usr/local/openresty/nginx/ /etc/nginx
   sed -i "s|\"version\": \"2.0.0\"|\"version\": \"$RELEASE\"|" /opt/nginxproxymanager/backend/package.json
@@ -132,6 +122,14 @@ function update_script() {
   chmod -R 777 /var/cache/nginx
   chown root /tmp/nginx
 
+  # Ubuntu-specific: Handle systemd-resolved DNS
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    echo "resolver 127.0.0.53 valid=10s;" >/etc/nginx/conf.d/include/resolvers.conf
+    echo "resolver_timeout 5s;" >> /etc/nginx/conf.d/include/resolvers.conf
+  else
+    echo resolver "$(awk 'BEGIN{ORS=" "} $1=="nameserver" {print ($2 ~ ":")? "["$2"]": $2}' /etc/resolv.conf);" >/etc/nginx/conf.d/include/resolvers.conf
+  fi
+
   if [ ! -f /data/nginx/dummycert.pem ] || [ ! -f /data/nginx/dummykey.pem ]; then
     $STD openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 -subj "/O=Nginx Proxy Manager/OU=Dummy Certificate/CN=localhost" -keyout /data/nginx/dummykey.pem -out /data/nginx/dummycert.pem
   fi
@@ -143,9 +141,6 @@ function update_script() {
   msg_info "Building Frontend"
   export NODE_OPTIONS="--max_old_space_size=2048 --openssl-legacy-provider"
   cd /opt/nginxproxymanager/frontend
-  
-  # Ubuntu-specific: Install frontend build dependencies
-  apt-get install -y libnss3-dev libgdk-pixbuf2.0-dev libgtk-3-dev libxss-dev
   
   # Replace node-sass with sass in package.json before installation
   sed -E -i 's/"node-sass" *: *"([^"]*)"/"sass": "\1"/g' package.json
@@ -176,273 +171,75 @@ EOF
   $STD yarn install --network-timeout 600000
   msg_ok "Initialized Backend"
 
-  msg_info "Updating Certbot"
-  # Ubuntu-specific: Use Snap for Certbot (recommended on Ubuntu)
-  if ! command -v certbot &>/dev/null; then
-    if command -v snap &>/dev/null; then
-      snap install core
-      snap refresh core
-      snap install --classic certbot
-      ln -s /snap/bin/certbot /usr/bin/certbot
-    else
-      # Fallback to APT installation
-      apt-get install -y certbot python3-certbot-dns-cloudflare
-    fi
-  else
-    # Update existing certbot
-    if [[ -x /snap/bin/certbot ]]; then
-      snap refresh certbot
-    elif [[ -d /opt/certbot ]]; then
-      $STD /opt/certbot/bin/pip install --upgrade pip setuptools wheel
-      $STD /opt/certbot/bin/pip install --upgrade certbot certbot-dns-cloudflare
-    fi
-  fi
-
-  # Configure OpenResty repository for Ubuntu
+  msg_info "Updating Certbot and OpenResty"
+  
+  # Ubuntu-specific: Get Ubuntu codename for OpenResty repo
   UBUNTU_CODENAME=$(lsb_release -sc)
-  [ -f /etc/apt/trusted.gpg.d/openresty.gpg ] || curl -fsSL https://openresty.org/package/pubkey.gpg | gpg --dearmor --yes -o /etc/apt/trusted.gpg.d/openresty.gpg
   
-  cat > /etc/apt/sources.list.d/openresty.list <<EOF
-deb http://openresty.org/package/ubuntu $UBUNTU_CODENAME main
+  # Clean up old OpenResty sources
+  [ -f /etc/apt/trusted.gpg.d/openresty-archive-keyring.gpg ] && rm -f /etc/apt/trusted.gpg.d/openresty-archive-keyring.gpg
+  [ -f /etc/apt/sources.list.d/openresty.list ] && rm -f /etc/apt/sources.list.d/openresty.list
+  [ -f /etc/apt/sources.list.d/openresty.sources ] && rm -f /etc/apt/sources.list.d/openresty.sources
+  
+  # Add OpenResty GPG key
+  [ ! -f /etc/apt/trusted.gpg.d/openresty.gpg ] && curl -fsSL https://openresty.org/package/pubkey.gpg | gpg --dearmor --yes -o /etc/apt/trusted.gpg.d/openresty.gpg
+  
+  # Configure OpenResty repository for Ubuntu using DEB822 format
+  cat <<EOF >/etc/apt/sources.list.d/openresty.sources
+Types: deb
+URIs: http://openresty.org/package/ubuntu
+Suites: ${UBUNTU_CODENAME}
+Components: main
+Signed-By: /etc/apt/trusted.gpg.d/openresty.gpg
 EOF
-  
+
   $STD apt update
   $STD apt -y install openresty
   
-  # Install additional Ubuntu packages for better performance
-  apt-get install -y \
-    libssl-dev \
-    zlib1g-dev \
-    libpcre3-dev \
-    libgd-dev \
-    libgeoip-dev \
-    libxslt1-dev
-  
-  msg_ok "Updated Certbot and Dependencies"
+  # Update Certbot if already installed
+  if [ -d /opt/certbot ]; then
+    $STD /opt/certbot/bin/pip install --upgrade pip setuptools wheel
+    $STD /opt/certbot/bin/pip install --upgrade certbot certbot-dns-cloudflare
+  fi
+  msg_ok "Updated Certbot and OpenResty"
 
   msg_info "Starting Services"
   sed -i 's/user npm/user root/g; s/^pid/#pid/g' /usr/local/openresty/nginx/conf/nginx.conf
   sed -r -i 's/^([[:space:]]*)su npm npm/\1#su npm npm/g;' /etc/logrotate.d/nginx-proxy-manager
   
-  # Ubuntu-specific: Configure systemd service limits
-  if [[ -f /etc/systemd/system/npm.service ]]; then
-    cat > /etc/systemd/system/npm.service.d/limits.conf <<EOF
-[Service]
-LimitNOFILE=65536
-LimitNPROC=65536
-EOF
-    systemctl daemon-reload
-  fi
-  
-  # Configure log rotation for Ubuntu
-  if [[ ! -f /etc/logrotate.d/nginx-proxy-manager ]]; then
-    cat > /etc/logrotate.d/nginx-proxy-manager <<EOF
-/var/log/nginx/*.log {
-  daily
-  missingok
-  rotate 14
-  compress
-  delaycompress
-  notifempty
-  create 0640 www-data adm
-  sharedscripts
-  postrotate
-    [ -f /var/run/nginx.pid ] && kill -USR1 \$(cat /var/run/nginx.pid)
-  endscript
-}
-EOF
-  fi
-  
+  # Ubuntu-specific: Ensure systemd services are properly configured
+  systemctl daemon-reload
   systemctl enable -q --now openresty
   systemctl enable -q --now npm
   systemctl restart openresty
   
-  # Ubuntu-specific: Enable UFW firewall rules (if UFW is installed)
-  if command -v ufw &>/dev/null; then
-    ufw allow 80/tcp comment "NPM HTTP"
-    ufw allow 443/tcp comment "NPM HTTPS"
-    ufw allow 81/tcp comment "NPM Admin"
+  # Ubuntu-specific: Configure UFW firewall if enabled
+  if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    msg_info "Configuring UFW firewall rules"
+    ufw allow 80/tcp comment 'NPM HTTP' >/dev/null 2>&1
+    ufw allow 443/tcp comment 'NPM HTTPS' >/dev/null 2>&1
+    ufw allow 81/tcp comment 'NPM Admin' >/dev/null 2>&1
+    msg_ok "UFW firewall configured"
   fi
   
   msg_ok "Started Services"
 
-  # Ubuntu-specific: Create maintenance script
-  cat > /usr/local/bin/npm-maintenance <<'EOF'
-#!/bin/bash
-echo "Nginx Proxy Manager Maintenance Script"
-echo "--------------------------------------"
-echo "1. Check service status"
-echo "2. View logs"
-echo "3. Backup database"
-echo "4. Restore database"
-echo "5. Renew SSL certificates"
-echo "6. Update NPM"
-echo "Enter your choice: "
-read choice
-
-case $choice in
-  1)
-    systemctl status npm
-    systemctl status openresty
-    ;;
-  2)
-    journalctl -u npm -f
-    ;;
-  3)
-    cp /data/database.sqlite /data/database.sqlite.backup.$(date +%Y%m%d_%H%M%S)
-    echo "Database backed up"
-    ;;
-  4)
-    echo "Restore from which backup? (enter filename): "
-    read backupfile
-    cp "$backupfile" /data/database.sqlite
-    systemctl restart npm
-    ;;
-  5)
-    certbot renew --nginx
-    systemctl reload nginx
-    ;;
-  6)
-    echo "Running update script..."
-    bash "$0" update
-    ;;
-  *)
-    echo "Invalid choice"
-    ;;
-esac
-EOF
-  chmod +x /usr/local/bin/npm-maintenance
-
   msg_ok "Updated successfully!"
-  msg_info "Maintenance script created: /usr/local/bin/npm-maintenance"
   exit
 }
 
-# Initial setup function for Ubuntu - FIXED VERSION
-function ubuntu_optimized_setup() {
-  msg_info "Performing Ubuntu-optimized setup"
-  
-  # First, fix any broken packages
-  msg_info "Fixing broken packages..."
-  apt-get update --fix-missing
-  apt-get install -f -y
-  dpkg --configure -a
-  
-  # Clean up any partial installations
-  apt-get clean
-  apt-get autoclean
-  
-  # Update package list
-  msg_info "Updating package lists..."
-  apt-get update
-  
-  # Install minimal dependencies first (split into smaller groups)
-  msg_info "Installing essential dependencies..."
-  
-  # Group 1: Core packages (usually available)
-  apt-get install -y \
-    curl \
-    wget \
-    gnupg \
-    lsb-release \
-    ca-certificates
-  
-  # Group 2: APT utilities
-  apt-get install -y \
-    apt-transport-https \
-    software-properties-common
-  
-  # Group 3: Optional packages (install separately with error handling)
-  for pkg in ufw snapd; do
-    if apt-get install -y $pkg 2>/dev/null; then
-      msg_ok "Installed $pkg"
-    else
-      msg_warning "Could not install $pkg, skipping..."
-    fi
-  done
-  
-  # Configure timezone (optional)
-  if command -v timedatectl &>/dev/null; then
-    timedatectl set-timezone UTC
-  fi
-  
-  # Optimize swap (for low-memory containers)
-  if [[ $var_ram -lt 4096 ]]; then
-    echo "vm.swappiness=10" >> /etc/sysctl.conf
-    echo "vm.vfs_cache_pressure=50" >> /etc/sysctl.conf
-    sysctl -p
-  fi
-  
-  # Configure systemd journal to limit size
-  mkdir -p /etc/systemd/journald.conf.d
-  cat > /etc/systemd/journald.conf.d/00-limits.conf <<EOF
-[Journal]
-SystemMaxUse=100M
-RuntimeMaxUse=50M
-EOF
-  
-  # Create alternative sources.list if needed
-  if ! apt-get update 2>/dev/null; then
-    msg_warning "APT sources may need fixing..."
-    # Backup original sources
-    cp /etc/apt/sources.list /etc/apt/sources.list.bak
-    
-    # Create minimal sources list for Ubuntu
-    cat > /etc/apt/sources.list <<EOF
-deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc) main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-security main restricted universe multiverse
-EOF
-    
-    apt-get update
-  fi
-  
-  msg_ok "Ubuntu setup completed"
-}
-
-# Alternative: Simplified Ubuntu setup without problematic packages
-function minimal_ubuntu_setup() {
-  msg_info "Performing minimal Ubuntu setup"
-  
-  # Fix package manager first
-  apt-get update --fix-missing
-  apt-get install -f -y
-  dpkg --configure -a
-  
-  # Install only essential packages
-  ESSENTIAL_PKGS="curl wget gnupg ca-certificates lsb-release apt-transport-https"
-  
-  for pkg in $ESSENTIAL_PKGS; do
-    if ! dpkg -l | grep -q "^ii  $pkg "; then
-      apt-get install -y $pkg
-    fi
-  done
-  
-  # Update package lists
-  apt-get update
-  
-  msg_ok "Minimal Ubuntu setup completed"
-}
-
 start
-
-# Try optimized setup, fall back to minimal if it fails
-if ubuntu_optimized_setup; then
-  msg_ok "Ubuntu optimization successful"
-else
-  msg_warning "Falling back to minimal setup..."
-  minimal_ubuntu_setup
-fi
-
 build_container
 description
 
 msg_ok "Completed Successfully!\n"
-echo -e "${CREATING}${GN}${APP} setup has been successfully initialized on Ubuntu!${CL}"
+echo -e "${CREATING}${GN}${APP} setup has been successfully initialized on Ubuntu ${var_version}!${CL}"
 echo -e "${INFO}${YW} Access it using the following URL:${CL}"
 echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:81${CL}"
-echo -e "${INFO}${YW} Ubuntu optimizations applied:${CL}"
-echo -e "${TAB}${BGN}• Fixed package dependencies${CL}"
-echo -e "${TAB}${BGN}• Minimal essential packages${CL}"
-echo -e "${TAB}${BGN}• Systemd-resolved integration${CL}"
-echo -e "${TAB}${BGN}• Optimized system limits${CL}"
+echo -e "${INFO}${YW} Default credentials:${CL}"
+echo -e "${TAB}${BGN}Email:    admin@example.com${CL}"
+echo -e "${TAB}${BGN}Password: changeme${CL}"
+echo -e "${INFO}${YW} Ubuntu-specific features enabled:${CL}"
+echo -e "${TAB}${BGN}• systemd-resolved DNS integration${CL}"
+echo -e "${TAB}${BGN}• UFW firewall auto-configuration${CL}"
+echo -e "${TAB}${BGN}• OpenResty from official Ubuntu repos${CL}"
