@@ -318,26 +318,53 @@ EOF
   exit
 }
 
-# Initial setup function for Ubuntu
+# Initial setup function for Ubuntu - FIXED VERSION
 function ubuntu_optimized_setup() {
   msg_info "Performing Ubuntu-optimized setup"
   
+  # First, fix any broken packages
+  msg_info "Fixing broken packages..."
+  apt-get update --fix-missing
+  apt-get install -f -y
+  dpkg --configure -a
+  
+  # Clean up any partial installations
+  apt-get clean
+  apt-get autoclean
+  
   # Update package list
+  msg_info "Updating package lists..."
   apt-get update
   
-  # Install Ubuntu-specific dependencies
+  # Install minimal dependencies first (split into smaller groups)
+  msg_info "Installing essential dependencies..."
+  
+  # Group 1: Core packages (usually available)
   apt-get install -y \
-    software-properties-common \
-    apt-transport-https \
-    ca-certificates \
     curl \
+    wget \
     gnupg \
     lsb-release \
-    ufw \
-    snapd
+    ca-certificates
+  
+  # Group 2: APT utilities
+  apt-get install -y \
+    apt-transport-https \
+    software-properties-common
+  
+  # Group 3: Optional packages (install separately with error handling)
+  for pkg in ufw snapd; do
+    if apt-get install -y $pkg 2>/dev/null; then
+      msg_ok "Installed $pkg"
+    else
+      msg_warning "Could not install $pkg, skipping..."
+    fi
+  done
   
   # Configure timezone (optional)
-  timedatectl set-timezone UTC
+  if command -v timedatectl &>/dev/null; then
+    timedatectl set-timezone UTC
+  fi
   
   # Optimize swap (for low-memory containers)
   if [[ $var_ram -lt 4096 ]]; then
@@ -354,13 +381,58 @@ SystemMaxUse=100M
 RuntimeMaxUse=50M
 EOF
   
+  # Create alternative sources.list if needed
+  if ! apt-get update 2>/dev/null; then
+    msg_warning "APT sources may need fixing..."
+    # Backup original sources
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak
+    
+    # Create minimal sources list for Ubuntu
+    cat > /etc/apt/sources.list <<EOF
+deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc) main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu $(lsb_release -sc)-security main restricted universe multiverse
+EOF
+    
+    apt-get update
+  fi
+  
   msg_ok "Ubuntu setup completed"
+}
+
+# Alternative: Simplified Ubuntu setup without problematic packages
+function minimal_ubuntu_setup() {
+  msg_info "Performing minimal Ubuntu setup"
+  
+  # Fix package manager first
+  apt-get update --fix-missing
+  apt-get install -f -y
+  dpkg --configure -a
+  
+  # Install only essential packages
+  ESSENTIAL_PKGS="curl wget gnupg ca-certificates lsb-release apt-transport-https"
+  
+  for pkg in $ESSENTIAL_PKGS; do
+    if ! dpkg -l | grep -q "^ii  $pkg "; then
+      apt-get install -y $pkg
+    fi
+  done
+  
+  # Update package lists
+  apt-get update
+  
+  msg_ok "Minimal Ubuntu setup completed"
 }
 
 start
 
-# Run Ubuntu optimization before building container
-ubuntu_optimized_setup
+# Try optimized setup, fall back to minimal if it fails
+if ubuntu_optimized_setup; then
+  msg_ok "Ubuntu optimization successful"
+else
+  msg_warning "Falling back to minimal setup..."
+  minimal_ubuntu_setup
+fi
 
 build_container
 description
@@ -369,9 +441,8 @@ msg_ok "Completed Successfully!\n"
 echo -e "${CREATING}${GN}${APP} setup has been successfully initialized on Ubuntu!${CL}"
 echo -e "${INFO}${YW} Access it using the following URL:${CL}"
 echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:81${CL}"
-echo -e "${INFO}${YW} Ubuntu-specific optimizations applied:${CL}"
-echo -e "${TAB}${BGN}• Node.js 22 from Nodesource${CL}"
+echo -e "${INFO}${YW} Ubuntu optimizations applied:${CL}"
+echo -e "${TAB}${BGN}• Fixed package dependencies${CL}"
+echo -e "${TAB}${BGN}• Minimal essential packages${CL}"
 echo -e "${TAB}${BGN}• Systemd-resolved integration${CL}"
-echo -e "${TAB}${BGN}• UFW firewall rules${CL}"
 echo -e "${TAB}${BGN}• Optimized system limits${CL}"
-echo -e "${TAB}${BGN}• Maintenance script: /usr/local/bin/npm-maintenance${CL}"
